@@ -1,0 +1,35 @@
+{
+  "name": "etoibleu-serveur-sip",
+  "version": "1.0.0",
+  "description": "Serveur pont SIP/RTP <-> ElevenLabs Conversational AI pour triage médical",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "lint": "eslint src/**/*.ts"
+  },
+  "keywords": [
+    "sip",
+    "rtp",
+    "voip",
+    "elevenlabs",
+    "nodejs",
+    "typescript"
+  ],
+  "author": "Etoile Bleue",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "sip": "^0.0.6",
+    "uuid": "^10.0.0",
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.11",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.3"
+  }
+}
