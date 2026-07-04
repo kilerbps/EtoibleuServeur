@@ -62,12 +62,19 @@ export declare interface ElevenLabsClient {
 
 // ─── Classe principale ────────────────────────────────────────────────────────
 
+// Politique de reconnexion en cas de coupure anormale du WebSocket.
+const MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_DELAY_MS = 1000;
+
 export class ElevenLabsClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private readonly config: AppConfig;
   private readonly callId: string;
   private isConnected: boolean = false;
   private firstPacketReceived = false;
+  private intentionalClose = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * File d'attente circulaire pour les chunks audio entrants.
@@ -107,6 +114,7 @@ export class ElevenLabsClient extends EventEmitter {
   private handleOpen(): void {
     logger.info('[%s] WebSocket ElevenLabs ouvert.', this.callId);
     this.isConnected = true;
+    this.reconnectAttempts = 0; // Connexion réussie : réinitialiser le compteur
 
     // Envoyer la configuration de conversation
     const initMsg: ElevenLabsConversationConfig = {
@@ -176,6 +184,19 @@ export class ElevenLabsClient extends EventEmitter {
       meta.conversation_id,
       meta.agent_output_audio_format,
     );
+
+    // Contrôle critique : la téléphonie exige du μ-law 8 kHz. Si l'agent est
+    // configuré autrement, l'audio renvoyé à l'appelant sera inintelligible.
+    const format = meta.agent_output_audio_format;
+    if (format && format !== this.config.expectedAudioFormat) {
+      logger.error(
+        '[%s] ⚠ Format audio de l\'agent = "%s" mais "%s" est attendu. ' +
+        'Configurez l\'agent ElevenLabs en μ-law 8 kHz (entrée ET sortie), sinon l\'audio sera corrompu.',
+        this.callId,
+        format,
+        this.config.expectedAudioFormat,
+      );
+    }
   }
 
   private handleAudioEvent(event: ElevenLabsAudioEvent): void {
@@ -187,9 +208,7 @@ export class ElevenLabsClient extends EventEmitter {
 
     if (!this.firstPacketReceived) {
       this.firstPacketReceived = true;
-      console.log(`\n======================================================`);
-      console.log(`[CRASH TEST] 🤖 PREMIER PAQUET AUDIO REÇU D'ELEVENLABS !`);
-      console.log(`======================================================\n`);
+      logger.info('[%s] Premier paquet audio reçu d\'ElevenLabs.', this.callId);
     }
 
     // Décoder le Base64 directement en Buffer (pas de conversion intermédiaire)
@@ -225,6 +244,29 @@ export class ElevenLabsClient extends EventEmitter {
     logger.info('[%s] WebSocket ElevenLabs fermé (code=%d, raison=%s).', this.callId, code, reason || 'N/A');
     this.isConnected = false;
     this.ws = null;
+
+    // Fermeture volontaire (fin d'appel) : ne pas reconnecter.
+    if (this.intentionalClose) {
+      this.emit('disconnected', code, reason);
+      return;
+    }
+
+    // Fermeture anormale : tenter une reconnexion bornée pour ne pas couper l'appel.
+    if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      this.reconnectAttempts += 1;
+      logger.warn(
+        '[%s] Reconnexion ElevenLabs %d/%d dans %d ms...',
+        this.callId, this.reconnectAttempts, MAX_RECONNECT_ATTEMPTS, RECONNECT_DELAY_MS,
+      );
+      this.reconnectTimer = setTimeout(() => {
+        this.connect().catch((err: Error) => {
+          logger.error('[%s] Échec de reconnexion : %s', this.callId, err.message);
+        });
+      }, RECONNECT_DELAY_MS);
+      return;
+    }
+
+    logger.error('[%s] Reconnexion abandonnée après %d tentatives.', this.callId, MAX_RECONNECT_ATTEMPTS);
     this.emit('disconnected', code, reason);
   }
 
@@ -291,6 +333,13 @@ export class ElevenLabsClient extends EventEmitter {
 
   /** Ferme proprement la connexion WebSocket */
   disconnect(): void {
+    this.intentionalClose = true;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       logger.info('[%s] Fermeture WebSocket ElevenLabs.', this.callId);
       this.ws.close(1000, 'Appel terminé');

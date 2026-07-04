@@ -17,9 +17,9 @@
  */
 
 import * as sip from 'sip';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { createLogger } from './logger';
-import { RtpHandler, allocateRtpPort } from './rtpHandler';
+import { RtpHandler } from './rtpHandler';
 import { ElevenLabsClient } from './elevenLabsClient';
 import type { AppConfig, ActiveCall, SdpMediaInfo } from './types';
 
@@ -43,6 +43,15 @@ const rtpHandlers = new Map<string, RtpHandler>();
 const aiClients = new Map<string, ElevenLabsClient>();
 /** Map<callId, NodeJS.Timeout> — timers de sécurité */
 const callTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Map<callId, SipRequest> — INVITE en attente d'ACK (pour répondre 487 sur CANCEL) */
+const pendingInvites = new Map<string, sip.SipRequest>();
+
+/** Adresse IP source réelle d'une requête SIP (via header de transport). */
+function getSourceIp(request: sip.SipRequest): string | null {
+  const via = request.headers['via'] as Array<{ host?: string; received?: string; params?: Record<string, string> }> | undefined;
+  const top = via?.[0];
+  return top?.received ?? top?.params?.['received'] ?? top?.host ?? null;
+}
 
 // ─── Parseur SDP ─────────────────────────────────────────────────────────────
 
@@ -133,11 +142,7 @@ function buildAnswerSdp(localIp: string, localRtpPort: number, sessionId: string
 // ─── Gestion des en-têtes SIP ─────────────────────────────────────────────────
 
 function generateTag(): string {
-  return uuidv4().replace(/-/g, '').substring(0, 8);
-}
-
-function generateBranch(): string {
-  return `z9hG4bK-${uuidv4().replace(/-/g, '').substring(0, 12)}`;
+  return randomUUID().replace(/-/g, '').substring(0, 8);
 }
 
 // ─── Cycle de vie d'un appel ─────────────────────────────────────────────────
@@ -150,22 +155,15 @@ async function startCallBridge(callId: string, config: AppConfig): Promise<void>
   const call = activeCalls.get(callId);
   if (!call) return;
 
-  logger.info('[%s] Démarrage du pont audio.', callId);
-
-  // ── Créer et lier le socket RTP ──
-  const rtpHandler = new RtpHandler(call.localRtpPort, config.serverIp);
-  rtpHandlers.set(callId, rtpHandler);
-
-  // Configurer l'adresse distante dès le départ (depuis le SDP)
-  rtpHandler.setRemote(call.remoteSdp.remoteIp, call.remoteSdp.remoteRtpPort);
-
-  try {
-    await rtpHandler.bind();
-  } catch (err) {
-    logger.error('[%s] Impossible de lier le socket RTP : %s', callId, (err as Error).message);
+  // Le socket RTP a déjà été créé et lié dans handleInvite.
+  const rtpHandler = rtpHandlers.get(callId);
+  if (!rtpHandler) {
+    logger.error('[%s] RtpHandler introuvable au démarrage du pont.', callId);
     terminateCall(callId);
     return;
   }
+
+  logger.info('[%s] Démarrage du pont audio.', callId);
 
   // ── Créer le client ElevenLabs ──
   const aiClient = new ElevenLabsClient(config, callId);
@@ -177,14 +175,9 @@ async function startCallBridge(callId: string, config: AppConfig): Promise<void>
   });
 
   // ── Pont ElevenLabs → RTP (réponse IA → appelant) ──
+  // Le RtpHandler met en file et émet à cadence régulière (20 ms) : pas de rafale.
   aiClient.on('audioChunk', (pcmuBuffer: Buffer) => {
-    // L'API ElevenLabs retourne des chunks de taille variable.
-    // On les découpe en blocs de 160 octets (20ms à 8kHz) pour le RTP.
-    const chunkSize = 160;
-    for (let offset = 0; offset < pcmuBuffer.length; offset += chunkSize) {
-      const slice = pcmuBuffer.subarray(offset, Math.min(offset + chunkSize, pcmuBuffer.length));
-      rtpHandler.sendPcmu(slice);
-    }
+    rtpHandler.enqueueAudio(pcmuBuffer);
   });
 
   aiClient.on('userTranscript', (text) => {
@@ -237,6 +230,8 @@ function terminateCall(callId: string): void {
     callTimers.delete(callId);
   }
 
+  pendingInvites.delete(callId);
+
   const rtp = rtpHandlers.get(callId);
   if (rtp) {
     rtp.close();
@@ -283,9 +278,6 @@ export function startSipServer(config: AppConfig): () => void {
 
       switch (method) {
         case 'INVITE':
-          console.log(`\n======================================================`);
-          console.log(`[CRASH TEST] 📞 SIP INVITE REÇU (Call-ID: ${callId})`);
-          console.log(`======================================================\n`);
           await handleInvite(request, config);
           break;
 
@@ -330,15 +322,35 @@ export function startSipServer(config: AppConfig): () => void {
 // ─── Handlers individuels ─────────────────────────────────────────────────────
 
 async function handleInvite(request: sip.SipRequest, config: AppConfig): Promise<void> {
-  const callId: string = (request.headers['call-id'] as string | undefined) ?? uuidv4();
+  const callId: string = (request.headers['call-id'] as string | undefined) ?? randomUUID();
   const fromHeader = request.headers['from'] as any;
   const fromTag = fromHeader?.params?.tag ?? generateTag();
   const toTag = generateTag();
+
+  // ── 0. Contrôle d'accès (liste blanche d'IP) ──
+  if (config.sipAllowedIps.length > 0) {
+    const sourceIp = getSourceIp(request);
+    if (!sourceIp || !config.sipAllowedIps.includes(sourceIp)) {
+      logger.warn('[%s] INVITE refusé — IP source non autorisée : %s', callId, sourceIp ?? 'inconnue');
+      sipClient.send(sip.makeResponse(request, 403, 'Forbidden'));
+      return;
+    }
+  }
+
+  // ── 0bis. Limite d'appels simultanés (protection ressources/coûts) ──
+  if (activeCalls.size >= config.maxConcurrentCalls) {
+    logger.warn('[%s] INVITE refusé — limite d\'appels simultanés atteinte (%d).', callId, config.maxConcurrentCalls);
+    sipClient.send(sip.makeResponse(request, 486, 'Busy Here'));
+    return;
+  }
 
   // ── 1. Répondre 100 Trying immédiatement ──
   const trying = sip.makeResponse(request, 100, 'Trying');
   sipClient.send(trying);
   logger.info('[%s] → 100 Trying envoyé.', callId);
+
+  // Conserver l'INVITE pour pouvoir répondre 487 en cas de CANCEL avant l'ACK.
+  pendingInvites.set(callId, request);
 
   // ── 2. Parser le SDP entrant ──
   const sdpBody = typeof request.content === 'string'
@@ -349,21 +361,25 @@ async function handleInvite(request: sip.SipRequest, config: AppConfig): Promise
   if (!remoteSdp) {
     logger.error('[%s] SDP invalide ou manquant. Rejet (488).', callId);
     sipClient.send(sip.makeResponse(request, 488, 'Not Acceptable Here'));
+    pendingInvites.delete(callId);
     return;
   }
 
-  // ── 3. Allouer un port RTP local ──
+  // ── 3. Créer et lier le socket RTP (allocation de port sans race) ──
+  const rtpHandler = new RtpHandler(config.serverIp, config.rtpPortMin, config.rtpPortMax);
   let localRtpPort: number;
   try {
-    localRtpPort = await allocateRtpPort(config.rtpPortMin, config.rtpPortMax, config.serverIp);
-    console.log(`\n======================================================`);
-    console.log(`[CRASH TEST] 🔓 PORT UDP RTP DYNAMIQUE OUVERT : ${localRtpPort} SUR L'IP ${config.serverIp}`);
-    console.log(`======================================================\n`);
+    localRtpPort = await rtpHandler.bind();
+    logger.info('[%s] Port RTP local ouvert : %d (IP %s).', callId, localRtpPort, config.serverIp);
   } catch (err) {
     logger.error('[%s] Impossible d\'allouer un port RTP : %s', callId, (err as Error).message);
     sipClient.send(sip.makeResponse(request, 503, 'Service Unavailable'));
+    pendingInvites.delete(callId);
     return;
   }
+  // Adresse distante provisoire depuis le SDP (sera corrigée par RTP symétrique)
+  rtpHandler.setRemote(remoteSdp.remoteIp, remoteSdp.remoteRtpPort);
+  rtpHandlers.set(callId, rtpHandler);
 
   // Extraire l'adresse de l'appelant depuis le Via header
   const via = request.headers['via'] as Array<{ host: string; port?: number }> | undefined;
@@ -385,12 +401,7 @@ async function handleInvite(request: sip.SipRequest, config: AppConfig): Promise
 
   // ── 5. Construire et envoyer le 200 OK avec notre SDP ──
   const answerSdp = buildAnswerSdp(config.serverIp, localRtpPort, callId);
-  console.log(`\n======================================================`);
-  console.log(`[CRASH TEST] 📝 SDP NÉGOCIÉ (200 OK) :`);
-  console.log(`    -> IP : ${config.serverIp}`);
-  console.log(`    -> Port RTP : ${localRtpPort}`);
-  console.log(`    -> Codec : G.711 PCMU (PT=0) @ 8000Hz`);
-  console.log(`======================================================\n`);
+  logger.info('[%s] SDP négocié : %s:%d, PCMU/8000 (PT=0).', callId, config.serverIp, localRtpPort);
 
   const ok200 = sip.makeResponse(request, 200, 'OK');
   // Ajouter le tag To
@@ -419,8 +430,8 @@ async function handleInvite(request: sip.SipRequest, config: AppConfig): Promise
 
 function handleAck(callId: string): void {
   logger.info('[%s] ← ACK reçu — dialogue SIP établi.', callId);
-  // L'ACK confirme que le 200 OK a bien été reçu.
-  // Le pont audio est déjà démarré dans handleInvite.
+  // L'ACK confirme que le 200 OK a bien été reçu ; l'INVITE n'est plus « en attente ».
+  pendingInvites.delete(callId);
 }
 
 function handleBye(request: sip.SipRequest, callId: string): void {
@@ -432,8 +443,16 @@ function handleBye(request: sip.SipRequest, callId: string): void {
 
 function handleCancel(request: sip.SipRequest, callId: string): void {
   logger.info('[%s] ← CANCEL reçu.', callId);
+  // 1. Répondre 200 OK au CANCEL lui-même
   sipClient.send(sip.makeResponse(request, 200, 'OK'));
-  // Envoyer 487 Request Terminated si l'INVITE était en cours
+
+  // 2. Répondre 487 Request Terminated à l'INVITE d'origine (RFC 3261 §9.2)
+  const invite = pendingInvites.get(callId);
+  if (invite) {
+    sipClient.send(sip.makeResponse(invite, 487, 'Request Terminated'));
+    logger.info('[%s] → 487 Request Terminated envoyé.', callId);
+  }
+
   terminateCall(callId);
 }
 

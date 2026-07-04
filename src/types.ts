@@ -13,6 +13,15 @@ export interface AppConfig {
   elevenLabsApiKey: string;
   elevenLabsAgentId: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /** Nombre maximum d'appels simultanés (protection ressources/coûts) */
+  maxConcurrentCalls: number;
+  /**
+   * Liste blanche d'IP autorisées à envoyer des INVITE.
+   * Vide = toutes les IP sont acceptées (à éviter en production).
+   */
+  sipAllowedIps: string[];
+  /** Format audio attendu de l'agent ElevenLabs (μ-law 8kHz pour la téléphonie) */
+  expectedAudioFormat: string;
 }
 
 // ─── SIP ───────────────────────────────────────────────────────────────────

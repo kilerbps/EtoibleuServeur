@@ -42,10 +42,11 @@ try {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  // Empêcher l'arrêt silencieux sur exception non gérée (tout en loggant l'erreur)
+  // Journaliser les exceptions non gérées SANS arrêter le serveur : une erreur
+  // isolée sur un appel ne doit pas couper tous les autres appels en cours.
+  // Les erreurs par appel sont déjà interceptées dans sipHandler/rtpHandler/elevenLabsClient.
   process.on('uncaughtException', (err) => {
-    mainLogger.error('Exception non gérée : %s', err.stack || err.message);
-    shutdown('uncaughtException');
+    mainLogger.error('Exception non gérée (serveur maintenu actif) : %s', err.stack || err.message);
   });
 
   process.on('unhandledRejection', (reason) => {
